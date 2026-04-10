@@ -64,6 +64,7 @@ typedef enum {
     CONTAINER_RUNNING,
     CONTAINER_STOPPED,
     CONTAINER_KILLED,
+    CONTAINER_HARD_LIMIT_KILLED,
     CONTAINER_EXITED
 } container_state_t;
 
@@ -408,6 +409,8 @@ static const char *state_to_string(container_state_t state)
         return "stopped";
     case CONTAINER_KILLED:
         return "killed";
+    case CONTAINER_HARD_LIMIT_KILLED:
+        return "hard_limit_killed";
     case CONTAINER_EXITED:
         return "exited";
     default:
@@ -802,14 +805,20 @@ static void reap_children(supervisor_ctx_t *ctx)
         record = find_container_by_pid_locked(ctx, child);
         if (record) {
             if (WIFEXITED(status)) {
+                if (ctx->monitor_fd >= 0)
+                    unregister_from_monitor(ctx->monitor_fd, record->id, record->host_pid);
                 record->state = CONTAINER_EXITED;
                 record->exit_code = WEXITSTATUS(status);
                 record->exit_signal = 0;
             } else if (WIFSIGNALED(status)) {
+                if (ctx->monitor_fd >= 0)
+                    unregister_from_monitor(ctx->monitor_fd, record->id, record->host_pid);
                 record->exit_signal = WTERMSIG(status);
                 record->exit_code = 128 + record->exit_signal;
                 if (record->stop_requested)
                     record->state = CONTAINER_STOPPED;
+                else if (record->exit_signal == SIGKILL)
+                    record->state = CONTAINER_HARD_LIMIT_KILLED;
                 else
                     record->state = CONTAINER_KILLED;
             }
@@ -932,6 +941,17 @@ static int launch_container(supervisor_ctx_t *ctx,
         return -1;
     }
     pthread_mutex_unlock(&ctx->metadata_lock);
+
+    if (ctx->monitor_fd >= 0) {
+        if (register_with_monitor(ctx->monitor_fd,
+                                  id,
+                                  child_pid,
+                                  soft_limit_bytes,
+                                  hard_limit_bytes) != 0) {
+            perror("ioctl(MONITOR_REGISTER)");
+            fprintf(stderr, "Warning: monitor registration failed for %s\n", id);
+        }
+    }
 
     if (child_pid_out != NULL)
         *child_pid_out = child_pid;
@@ -1303,6 +1323,10 @@ static int run_supervisor(const char *rootfs)
     printf("Control socket: %s\n", CONTROL_PATH);
     fflush(stdout);
 
+    ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
+    if (ctx.monitor_fd < 0)
+        perror("open(/dev/container_monitor)");
+
     while (!ctx.should_stop) {
         struct sockaddr_un client_address;
         socklen_t client_length = sizeof(client_address);
@@ -1366,6 +1390,8 @@ static int run_supervisor(const char *rootfs)
     free(ctx.containers);
     pthread_mutex_destroy(&ctx.metadata_lock);
     bounded_buffer_destroy(&ctx.log_buffer);
+    if (ctx.monitor_fd >= 0)
+        close(ctx.monitor_fd);
     return 0;
 }
 
