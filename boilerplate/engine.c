@@ -122,7 +122,15 @@ typedef struct {
     int log_write_fd;
 } child_config_t;
 
+typedef struct supervisor_ctx supervisor_ctx_t;
+
 typedef struct {
+    supervisor_ctx_t *ctx;
+    int log_read_fd;
+    char container_id[CONTAINER_ID_LEN];
+} log_producer_ctx_t;
+
+typedef struct supervisor_ctx {
     int server_fd;
     int monitor_fd;
     int should_stop;
@@ -161,6 +169,7 @@ typedef struct {
 
 static void stop_container(supervisor_ctx_t *ctx, const char *id);
 static int send_stop_control_request(const char *container_id);
+static container_record_t *find_container_by_id_locked(supervisor_ctx_t *ctx, const char *id);
 
 static int write_all(int fd, const void *buffer, size_t length)
 {
@@ -459,9 +468,23 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
 }
 
 /*
@@ -475,9 +498,45 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  */
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == 0 && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+
+    if (buffer->count == 0 && buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return 0;
+    }
+
+    *item = buffer->items[buffer->head];
+    buffer->head = (buffer->head + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count--;
+
+    pthread_cond_signal(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 1;
+}
+
+static int resolve_log_path(supervisor_ctx_t *ctx,
+                            const char *container_id,
+                            char *path,
+                            size_t path_len)
+{
+    container_record_t *record;
+
+    pthread_mutex_lock(&ctx->metadata_lock);
+    record = find_container_by_id_locked(ctx, container_id);
+    if (record != NULL)
+        strncpy(path, record->log_path, path_len - 1);
+    pthread_mutex_unlock(&ctx->metadata_lock);
+
+    if (record != NULL)
+        return 0;
+
+    if (snprintf(path, path_len, "%s/%s.log", LOG_DIR, container_id) >= (int)path_len)
+        return -1;
+
+    return 0;
 }
 
 /*
@@ -491,7 +550,58 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = arg;
+    log_item_t item;
+
+    while (1) {
+        char path[PATH_MAX] = {0};
+        int log_fd;
+
+        int pop_rc = bounded_buffer_pop(&ctx->log_buffer, &item);
+        if (pop_rc == 0)
+            break;
+
+        if (resolve_log_path(ctx, item.container_id, path, sizeof(path)) != 0)
+            continue;
+
+        log_fd = open(path, O_CREAT | O_WRONLY | O_APPEND, 0644);
+        if (log_fd < 0)
+            continue;
+
+        if (write_all(log_fd, item.data, item.length) != 0)
+            perror("write(log)");
+
+        close(log_fd);
+    }
+
+    return NULL;
+}
+
+static void *log_producer_thread(void *arg)
+{
+    log_producer_ctx_t *producer = arg;
+    log_item_t item;
+
+    memset(&item, 0, sizeof(item));
+    strncpy(item.container_id, producer->container_id, sizeof(item.container_id) - 1);
+
+    while (1) {
+        ssize_t bytes_read = read(producer->log_read_fd, item.data, sizeof(item.data));
+        if (bytes_read < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (bytes_read == 0)
+            break;
+
+        item.length = (size_t)bytes_read;
+        if (bounded_buffer_push(&producer->ctx->log_buffer, &item) != 0)
+            break;
+    }
+
+    close(producer->log_read_fd);
+    free(producer);
     return NULL;
 }
 
@@ -720,10 +830,21 @@ static int launch_container(supervisor_ctx_t *ctx,
                             pid_t *child_pid_out)
 {
     child_config_t *cfg;
+    log_producer_ctx_t *producer_cfg;
     void *child_stack;
+    pthread_t producer_thread;
     int log_fd;
+    int log_pipe[2] = {-1, -1};
     char log_path[PATH_MAX];
     pid_t child_pid;
+
+    pthread_mutex_lock(&ctx->metadata_lock);
+    if (find_container_by_id_locked(ctx, id) != NULL) {
+        pthread_mutex_unlock(&ctx->metadata_lock);
+        fprintf(stderr, "Container id already exists: %s\n", id);
+        return -1;
+    }
+    pthread_mutex_unlock(&ctx->metadata_lock);
 
     if (mkdir(LOG_DIR, 0755) < 0 && errno != EEXIST) {
         perror("mkdir(logs)");
@@ -740,14 +861,23 @@ static int launch_container(supervisor_ctx_t *ctx,
         perror("open(log)");
         return -1;
     }
+    close(log_fd);
+
+    if (pipe(log_pipe) < 0) {
+        perror("pipe(log)");
+        return -1;
+    }
 
     cfg = calloc(1, sizeof(*cfg));
+    producer_cfg = calloc(1, sizeof(*producer_cfg));
     child_stack = malloc(STACK_SIZE);
-    if (!cfg || !child_stack) {
+    if (!cfg || !producer_cfg || !child_stack) {
         perror("alloc child config/stack");
         free(cfg);
+        free(producer_cfg);
         free(child_stack);
-        close(log_fd);
+        close(log_pipe[0]);
+        close(log_pipe[1]);
         return -1;
     }
 
@@ -755,7 +885,23 @@ static int launch_container(supervisor_ctx_t *ctx,
     strncpy(cfg->rootfs, rootfs, sizeof(cfg->rootfs) - 1);
     strncpy(cfg->command, command, sizeof(cfg->command) - 1);
     cfg->nice_value = nice_value;
-    cfg->log_write_fd = log_fd;
+    cfg->log_write_fd = log_pipe[1];
+
+    producer_cfg->ctx = ctx;
+    producer_cfg->log_read_fd = log_pipe[0];
+    strncpy(producer_cfg->container_id, id, sizeof(producer_cfg->container_id) - 1);
+
+    if (pthread_create(&producer_thread, NULL, log_producer_thread, producer_cfg) != 0) {
+        perror("pthread_create(log_producer)");
+        free(cfg);
+        free(producer_cfg);
+        free(child_stack);
+        close(log_pipe[0]);
+        close(log_pipe[1]);
+        return -1;
+    }
+
+    pthread_detach(producer_thread);
 
     child_pid = clone(child_fn,
                       (char *)child_stack + STACK_SIZE,
@@ -763,23 +909,16 @@ static int launch_container(supervisor_ctx_t *ctx,
                       cfg);
     if (child_pid < 0) {
         perror("clone");
+        close(log_pipe[1]);
         free(cfg);
         free(child_stack);
-        close(log_fd);
         return -1;
     }
 
-    close(log_fd);
+    close(log_pipe[1]);
     free(cfg);
 
     pthread_mutex_lock(&ctx->metadata_lock);
-    if (find_container_by_id_locked(ctx, id) != NULL) {
-        pthread_mutex_unlock(&ctx->metadata_lock);
-        kill(child_pid, SIGTERM);
-        fprintf(stderr, "Container id already exists: %s\n", id);
-        return -1;
-    }
-
     if (add_container_record(ctx,
                              id,
                              child_pid,
@@ -1067,10 +1206,18 @@ static int run_supervisor(const char *rootfs)
     ctx.server_fd = -1;
     ctx.monitor_fd = -1;
 
+    rc = bounded_buffer_init(&ctx.log_buffer);
+    if (rc != 0) {
+        errno = rc;
+        perror("bounded_buffer_init");
+        return 1;
+    }
+
     rc = pthread_mutex_init(&ctx.metadata_lock, NULL);
     if (rc != 0) {
         errno = rc;
         perror("pthread_mutex_init");
+        bounded_buffer_destroy(&ctx.log_buffer);
         return 1;
     }
 
@@ -1079,6 +1226,17 @@ static int run_supervisor(const char *rootfs)
     if (!ctx.containers) {
         perror("calloc(containers)");
         pthread_mutex_destroy(&ctx.metadata_lock);
+        bounded_buffer_destroy(&ctx.log_buffer);
+        return 1;
+    }
+
+    rc = pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
+    if (rc != 0) {
+        errno = rc;
+        perror("pthread_create(logging_thread)");
+        free(ctx.containers);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        bounded_buffer_destroy(&ctx.log_buffer);
         return 1;
     }
 
@@ -1086,8 +1244,11 @@ static int run_supervisor(const char *rootfs)
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ctx.server_fd < 0) {
         perror("socket");
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        pthread_join(ctx.logger_thread, NULL);
         free(ctx.containers);
         pthread_mutex_destroy(&ctx.metadata_lock);
+        bounded_buffer_destroy(&ctx.log_buffer);
         return 1;
     }
 
@@ -1099,8 +1260,11 @@ static int run_supervisor(const char *rootfs)
         perror("bind");
         close(ctx.server_fd);
         unlink(CONTROL_PATH);
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        pthread_join(ctx.logger_thread, NULL);
         free(ctx.containers);
         pthread_mutex_destroy(&ctx.metadata_lock);
+        bounded_buffer_destroy(&ctx.log_buffer);
         return 1;
     }
 
@@ -1108,8 +1272,11 @@ static int run_supervisor(const char *rootfs)
         perror("listen");
         close(ctx.server_fd);
         unlink(CONTROL_PATH);
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        pthread_join(ctx.logger_thread, NULL);
         free(ctx.containers);
         pthread_mutex_destroy(&ctx.metadata_lock);
+        bounded_buffer_destroy(&ctx.log_buffer);
         return 1;
     }
 
@@ -1124,8 +1291,11 @@ static int run_supervisor(const char *rootfs)
         perror("sigaction");
         close(ctx.server_fd);
         unlink(CONTROL_PATH);
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        pthread_join(ctx.logger_thread, NULL);
         free(ctx.containers);
         pthread_mutex_destroy(&ctx.metadata_lock);
+        bounded_buffer_destroy(&ctx.log_buffer);
         return 1;
     }
 
@@ -1183,6 +1353,9 @@ static int run_supervisor(const char *rootfs)
     while (waitpid(-1, NULL, 0) > 0)
         ;
 
+    bounded_buffer_begin_shutdown(&ctx.log_buffer);
+    pthread_join(ctx.logger_thread, NULL);
+
     pthread_mutex_lock(&ctx.metadata_lock);
     for (size_t i = 0; i < ctx.container_count; i++) {
         free(ctx.containers[i].child_stack);
@@ -1192,6 +1365,7 @@ static int run_supervisor(const char *rootfs)
 
     free(ctx.containers);
     pthread_mutex_destroy(&ctx.metadata_lock);
+    bounded_buffer_destroy(&ctx.log_buffer);
     return 0;
 }
 
