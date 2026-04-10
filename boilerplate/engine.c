@@ -80,6 +80,9 @@ typedef struct container_record {
     char log_path[PATH_MAX];
     int stop_requested;
     void *child_stack;
+    pthread_t producer_thread;
+    int producer_thread_started;
+    int producer_thread_joined;
     int in_use;
 } container_record_t;
 
@@ -767,7 +770,8 @@ static int add_container_record(supervisor_ctx_t *ctx,
                                 unsigned long soft_limit_bytes,
                                 unsigned long hard_limit_bytes,
                                 const char *log_path,
-                                void *child_stack)
+                                void *child_stack,
+                                pthread_t producer_thread)
 {
     container_record_t *record;
 
@@ -787,6 +791,9 @@ static int add_container_record(supervisor_ctx_t *ctx,
     record->exit_signal = 0;
     record->stop_requested = 0;
     record->child_stack = child_stack;
+    record->producer_thread = producer_thread;
+    record->producer_thread_started = 1;
+    record->producer_thread_joined = 0;
     record->in_use = 1;
     strncpy(record->log_path, log_path, sizeof(record->log_path) - 1);
 
@@ -800,10 +807,18 @@ static void reap_children(supervisor_ctx_t *ctx)
 
     while ((child = waitpid(-1, &status, WNOHANG)) > 0) {
         container_record_t *record = NULL;
+        pthread_t producer_thread_to_join;
+        int join_needed = 0;
 
         pthread_mutex_lock(&ctx->metadata_lock);
         record = find_container_by_pid_locked(ctx, child);
         if (record) {
+            producer_thread_to_join = record->producer_thread;
+            if (record->producer_thread_started && !record->producer_thread_joined) {
+                record->producer_thread_joined = 1;
+                join_needed = 1;
+            }
+
             if (WIFEXITED(status)) {
                 if (ctx->monitor_fd >= 0)
                     unregister_from_monitor(ctx->monitor_fd, record->id, record->host_pid);
@@ -826,6 +841,9 @@ static void reap_children(supervisor_ctx_t *ctx)
             record->child_stack = NULL;
         }
         pthread_mutex_unlock(&ctx->metadata_lock);
+
+        if (join_needed)
+            pthread_join(producer_thread_to_join, NULL);
     }
 }
 
@@ -910,8 +928,6 @@ static int launch_container(supervisor_ctx_t *ctx,
         return -1;
     }
 
-    pthread_detach(producer_thread);
-
     child_pid = clone(child_fn,
                       (char *)child_stack + STACK_SIZE,
                       CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
@@ -919,6 +935,8 @@ static int launch_container(supervisor_ctx_t *ctx,
     if (child_pid < 0) {
         perror("clone");
         close(log_pipe[1]);
+        close(log_pipe[0]);
+        pthread_join(producer_thread, NULL);
         free(cfg);
         free(child_stack);
         return -1;
@@ -934,9 +952,11 @@ static int launch_container(supervisor_ctx_t *ctx,
                              soft_limit_bytes,
                              hard_limit_bytes,
                              log_path,
-                             child_stack) != 0) {
+                             child_stack,
+                             producer_thread) != 0) {
         pthread_mutex_unlock(&ctx->metadata_lock);
         kill(child_pid, SIGTERM);
+        pthread_join(producer_thread, NULL);
         fprintf(stderr, "Failed to store metadata for %s\n", id);
         return -1;
     }
@@ -1382,6 +1402,12 @@ static int run_supervisor(const char *rootfs)
 
     pthread_mutex_lock(&ctx.metadata_lock);
     for (size_t i = 0; i < ctx.container_count; i++) {
+        if (ctx.containers[i].producer_thread_started && !ctx.containers[i].producer_thread_joined) {
+            ctx.containers[i].producer_thread_joined = 1;
+            pthread_mutex_unlock(&ctx.metadata_lock);
+            pthread_join(ctx.containers[i].producer_thread, NULL);
+            pthread_mutex_lock(&ctx.metadata_lock);
+        }
         free(ctx.containers[i].child_stack);
         ctx.containers[i].child_stack = NULL;
     }
