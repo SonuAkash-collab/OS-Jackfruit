@@ -19,6 +19,9 @@ modules.order
 # Root filesystems
 rootfs-base/
 rootfs-*/
+boilerplate/rootfs/
+boilerplate/rootfs-base/
+boilerplate/rootfs-*/
 *.tar.gz
 
 # Logs

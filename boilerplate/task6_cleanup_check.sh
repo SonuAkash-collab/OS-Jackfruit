@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
 ENGINE="./engine"
-ROOTFS_BASE="./rootfs-base"
+ROOTFS_BASE=""
 ROOTFS_A="./rootfs-task6-a"
 ROOTFS_B="./rootfs-task6-b"
 
@@ -67,8 +67,12 @@ main() {
         echo "Build first with: make"
         exit 1
     fi
-    if [[ ! -d "$ROOTFS_BASE" ]]; then
-        echo "Missing $ROOTFS_BASE"
+    if [[ -d ./rootfs-base ]]; then
+        ROOTFS_BASE="./rootfs-base"
+    elif [[ -d ./rootfs ]]; then
+        ROOTFS_BASE="./rootfs"
+    else
+        echo "Missing rootfs template. Expected ./rootfs-base or ./rootfs"
         exit 1
     fi
 

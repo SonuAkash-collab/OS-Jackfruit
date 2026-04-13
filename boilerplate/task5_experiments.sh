@@ -9,7 +9,7 @@ RESULT_DIR="./experiments"
 RESULT_CSV="$RESULT_DIR/task5_results.csv"
 SUPERVISOR_LOG="$RESULT_DIR/supervisor.log"
 
-ROOTFS_BASE="./rootfs-base"
+ROOTFS_BASE=""
 ROOTFS_E1_A="./rootfs-task5-e1-a"
 ROOTFS_E1_B="./rootfs-task5-e1-b"
 ROOTFS_E2_A="./rootfs-task5-e2-a"
@@ -31,8 +31,12 @@ require_prereqs() {
         exit 1
     fi
 
-    if [[ ! -d "$ROOTFS_BASE" ]]; then
-        echo "Missing rootfs template: $ROOTFS_BASE"
+    if [[ -d ./rootfs-base ]]; then
+        ROOTFS_BASE="./rootfs-base"
+    elif [[ -d ./rootfs ]]; then
+        ROOTFS_BASE="./rootfs"
+    else
+        echo "Missing rootfs template. Expected ./rootfs-base or ./rootfs"
         exit 1
     fi
 

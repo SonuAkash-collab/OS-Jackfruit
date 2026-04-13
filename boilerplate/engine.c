@@ -70,6 +70,7 @@ typedef enum {
 
 typedef struct container_record {
     char id[CONTAINER_ID_LEN];
+    char rootfs_path[PATH_MAX];
     pid_t host_pid;
     time_t started_at;
     container_state_t state;
@@ -175,6 +176,41 @@ static void stop_container(supervisor_ctx_t *ctx, const char *id);
 static int send_stop_control_request(const char *container_id);
 static container_record_t *find_container_by_id_locked(supervisor_ctx_t *ctx, const char *id);
 
+static int normalize_rootfs_path(const char *input, char *output, size_t output_len)
+{
+    char resolved[PATH_MAX];
+
+    if (realpath(input, resolved) != NULL) {
+        if (snprintf(output, output_len, "%s", resolved) >= (int)output_len)
+            return -1;
+        return 0;
+    }
+
+    if (snprintf(output, output_len, "%s", input) >= (int)output_len)
+        return -1;
+
+    return 0;
+}
+
+static int parse_exit_code_line(const char *line, int *exit_code_out)
+{
+    const char *marker = strstr(line, "exit_code=");
+    char *end = NULL;
+    long value;
+
+    if (!marker)
+        return 0;
+
+    marker += strlen("exit_code=");
+    errno = 0;
+    value = strtol(marker, &end, 10);
+    if (errno != 0 || marker == end)
+        return 0;
+
+    *exit_code_out = (int)value;
+    return 1;
+}
+
 static int write_all(int fd, const void *buffer, size_t length)
 {
     const char *cursor = buffer;
@@ -260,6 +296,10 @@ static int send_control_request_once(const control_request_t *req)
     int rc = 0;
     char buffer[1024];
     int stop_forwarded = 0;
+    int run_exit_code = 0;
+    int run_exit_code_seen = 0;
+    char line_buffer[2048];
+    size_t line_buffer_len = 0;
 
     fd = connect_to_supervisor();
     if (fd < 0) {
@@ -295,9 +335,54 @@ static int send_control_request_once(const control_request_t *req)
         buffer[bytes_read] = '\0';
         fputs(buffer, stdout);
         fflush(stdout);
+
+        if (req->kind == CMD_RUN) {
+            size_t offset = 0;
+
+            while (offset < (size_t)bytes_read) {
+                size_t available = (size_t)bytes_read - offset;
+                char *newline = memchr(buffer + offset, '\n', available);
+                size_t chunk_len;
+
+                if (newline)
+                    chunk_len = (size_t)(newline - (buffer + offset)) + 1;
+                else
+                    chunk_len = available;
+
+                if (line_buffer_len + chunk_len >= sizeof(line_buffer))
+                    line_buffer_len = 0;
+
+                memcpy(line_buffer + line_buffer_len, buffer + offset, chunk_len);
+                line_buffer_len += chunk_len;
+
+                if (newline) {
+                    int parsed_exit_code = 0;
+
+                    line_buffer[line_buffer_len - 1] = '\0';
+                    if (parse_exit_code_line(line_buffer, &parsed_exit_code) != 0) {
+                        run_exit_code = parsed_exit_code;
+                        run_exit_code_seen = 1;
+                    }
+                    line_buffer_len = 0;
+                }
+
+                offset += chunk_len;
+            }
+        }
     }
 
     close(fd);
+
+    if (req->kind == CMD_RUN) {
+        if (rc != 0)
+            return rc;
+
+        if (!run_exit_code_seen)
+            return 1;
+
+        return run_exit_code;
+    }
+
     return rc;
 }
 
@@ -766,6 +851,7 @@ static container_record_t *find_container_by_pid_locked(supervisor_ctx_t *ctx, p
 
 static int add_container_record(supervisor_ctx_t *ctx,
                                 const char *id,
+                                const char *rootfs_path,
                                 pid_t pid,
                                 unsigned long soft_limit_bytes,
                                 unsigned long hard_limit_bytes,
@@ -782,6 +868,7 @@ static int add_container_record(supervisor_ctx_t *ctx,
     memset(record, 0, sizeof(*record));
 
     strncpy(record->id, id, sizeof(record->id) - 1);
+    strncpy(record->rootfs_path, rootfs_path, sizeof(record->rootfs_path) - 1);
     record->host_pid = pid;
     record->started_at = time(NULL);
     record->state = CONTAINER_RUNNING;
@@ -796,6 +883,26 @@ static int add_container_record(supervisor_ctx_t *ctx,
     record->producer_thread_joined = 0;
     record->in_use = 1;
     strncpy(record->log_path, log_path, sizeof(record->log_path) - 1);
+
+    return 0;
+}
+
+static int has_running_rootfs_conflict_locked(supervisor_ctx_t *ctx, const char *rootfs_path)
+{
+    size_t i;
+
+    for (i = 0; i < ctx->container_count; i++) {
+        const container_record_t *record = &ctx->containers[i];
+
+        if (!record->in_use)
+            continue;
+
+        if (record->state != CONTAINER_RUNNING && record->state != CONTAINER_STARTING)
+            continue;
+
+        if (strncmp(record->rootfs_path, rootfs_path, sizeof(record->rootfs_path)) == 0)
+            return 1;
+    }
 
     return 0;
 }
@@ -863,12 +970,26 @@ static int launch_container(supervisor_ctx_t *ctx,
     int log_fd;
     int log_pipe[2] = {-1, -1};
     char log_path[PATH_MAX];
+    char normalized_rootfs[PATH_MAX];
     pid_t child_pid;
+
+    if (normalize_rootfs_path(rootfs, normalized_rootfs, sizeof(normalized_rootfs)) != 0) {
+        fprintf(stderr, "Invalid rootfs path for %s\n", id);
+        return -1;
+    }
 
     pthread_mutex_lock(&ctx->metadata_lock);
     if (find_container_by_id_locked(ctx, id) != NULL) {
         pthread_mutex_unlock(&ctx->metadata_lock);
         fprintf(stderr, "Container id already exists: %s\n", id);
+        return -1;
+    }
+
+    if (has_running_rootfs_conflict_locked(ctx, normalized_rootfs)) {
+        pthread_mutex_unlock(&ctx->metadata_lock);
+        fprintf(stderr,
+                "Rootfs already in use by another running container: %s\n",
+                normalized_rootfs);
         return -1;
     }
     pthread_mutex_unlock(&ctx->metadata_lock);
@@ -948,6 +1069,7 @@ static int launch_container(supervisor_ctx_t *ctx,
     pthread_mutex_lock(&ctx->metadata_lock);
     if (add_container_record(ctx,
                              id,
+                             normalized_rootfs,
                              child_pid,
                              soft_limit_bytes,
                              hard_limit_bytes,
@@ -1165,39 +1287,6 @@ static void *control_client_thread(void *arg)
     close(client->client_fd);
     free(client);
     return NULL;
-}
-
-static void print_metadata(supervisor_ctx_t *ctx)
-{
-    size_t i;
-
-    pthread_mutex_lock(&ctx->metadata_lock);
-    printf("%-16s %-8s %-12s %-12s %-12s %-10s %-10s %-20s\n",
-           "id",
-           "pid",
-           "state",
-           "soft(MiB)",
-           "hard(MiB)",
-           "exit_code",
-           "signal",
-           "log_path");
-
-    for (i = 0; i < ctx->container_count; i++) {
-        const container_record_t *r = &ctx->containers[i];
-        if (!r->in_use)
-            continue;
-
-        printf("%-16s %-8d %-12s %-12lu %-12lu %-10d %-10d %-20s\n",
-               r->id,
-               r->host_pid,
-               state_to_string(r->state),
-               r->soft_limit_bytes >> 20,
-               r->hard_limit_bytes >> 20,
-               r->exit_code,
-               r->exit_signal,
-               r->log_path);
-    }
-    pthread_mutex_unlock(&ctx->metadata_lock);
 }
 
 static void stop_container(supervisor_ctx_t *ctx, const char *id)
