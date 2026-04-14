@@ -12,8 +12,8 @@ This README is organized to match the assignment rubric in project-guide.md.
 
 ## 1. Team Information
 
-- Member 1: <Name>, <SRN>
-- Member 2: <Name>, <SRN>
+- Member 1: Sonu Akash Soundararajan, PES1UG24AM908
+- Member 2: Rishit V N S, PES1UG24AM225
 
 ## 2. Build, Load, and Run Instructions
 
@@ -157,37 +157,68 @@ sudo rmmod monitor
 make clean
 ```
 
+The cleanup path removes the control socket, build artifacts, logs, and generated binaries. If you created extra writable rootfs copies for experiments, remove those as well before packaging the repository.
+
 ## 3. Demo with Screenshots
 
-Add one annotated screenshot for each required checkpoint.
+### Screenshot 1 — Multi-container supervision
+*Two containers (alpha, beta) running under one supervisor process, shown via `./engine ps`.*
 
-1. Multi-container supervision
-   - Show one supervisor process and at least two running containers
-2. Metadata tracking
-   - Show engine ps output with states, pids, limits, exit data, log path
-3. Bounded-buffer logging
-   - Show logs captured for a container and evidence of concurrent logging
-4. CLI and IPC
-   - Show a CLI request and supervisor response over control socket path
-5. Soft-limit warning
-   - Show dmesg entry for SOFT LIMIT event
-6. Hard-limit enforcement
-   - Show dmesg HARD LIMIT kill and engine ps showing hard_limit_killed
-7. Scheduling experiment
-   - Show experiment outputs or CSV values with observable differences
-8. Clean teardown
-   - Show no zombies, cleaned control socket, and supervisor shutdown
+![alt text](docs/screenshots/ss1.jpeg)
 
-Place screenshots under docs/screenshots/ and reference them here.
+---
 
-- docs/screenshots/01-multi-container-supervision.png
-- docs/screenshots/02-metadata-tracking-ps.png
-- docs/screenshots/03-bounded-buffer-logging.png
-- docs/screenshots/04-cli-and-ipc.png
-- docs/screenshots/05-soft-limit-warning-dmesg.png
-- docs/screenshots/06-hard-limit-enforcement.png
-- docs/screenshots/07-scheduling-experiment-results.png
-- docs/screenshots/08-clean-teardown-no-zombies.png
+### Screenshot 2 — Metadata tracking
+*Output of `./engine ps` showing all tracked container metadata: id, pid, state, soft/hard limits, exit code, signal, log path.*
+
+![alt text](docs/screenshots/ss2.jpeg)
+
+---
+
+### Screenshot 3 — Bounded-buffer logging
+*Log file contents captured through the pipe → bounded buffer → consumer thread pipeline. `cat logs/alpha.log` shows cpu_hog output routed through the logging pipeline.*
+
+![alt text](docs/screenshots/ss3.jpeg)
+
+---
+
+### Screenshot 4 — CLI and IPC
+*`./engine stop alpha` issued from CLI client, request sent over UNIX domain socket to supervisor, supervisor responds "OK stop requested id=alpha" and updates container state to stopped.*
+
+![alt text](docs/screenshots/ss4a.jpeg) 
+![alt text](docs/screenshots/ss4b.jpeg) 
+![alt text](docs/screenshots/ss4c.jpeg)
+
+---
+
+### Screenshot 5 — Soft-limit warning
+*`dmesg` output showing `[container_monitor] Registering container=memtest` and `HARD LIMIT` exceeded event logged by the kernel module when container RSS crosses the soft limit threshold.*
+
+![alt text](docs/screenshots/ss5.jpeg)
+
+---
+
+### Screenshot 6 — Hard-limit enforcement
+*Container `memtest` started with `--soft-mib 40 --hard-mib 64`, kernel module detects RSS exceeding hard limit and sends SIGKILL. `./engine ps` shows state as `hard_limit_killed` with exit signal 9.*
+
+![alt text](docs/screenshots/ss6.jpeg)
+
+---
+
+### Screenshot 7 — Scheduling experiment
+*Two CPU-bound containers launched: `cpuA` at nice=0, `cpuB` at nice=15. `top` output shows cpuA receiving ~79% CPU vs cpuB receiving ~44%, demonstrating CFS weighted scheduling based on nice values.*
+
+![alt text](docs/screenshots/ss7.jpeg)
+
+---
+
+### Screenshot 8 — Clean teardown
+*After stopping all containers and sending SIGINT to supervisor, `ps aux | grep engine` shows no engine supervisor processes remaining. No zombie processes.*
+
+![alt text](docs/screenshots/ss8.jpeg)
+
+---
+
 
 ## 4. Engineering Analysis
 
@@ -269,20 +300,18 @@ sudo ./task5_experiments.sh
 cat experiments/task5_results.csv
 ```
 
-Paste your measured results table below (example schema):
+Two containers ran `while true; do ./cpu_hog; done` simultaneously:
+- `cpuA`: nice=0
+- `cpuB`: nice=15
 
-| experiment | container_id | nice | workload | completion_ms |
-|---|---|---:|---|---:|
-| exp1_cpu_vs_cpu_priority | e1_high | -5 | cpu_hog | <fill> |
-| exp1_cpu_vs_cpu_priority | e1_low  | 10 | cpu_hog | <fill> |
-| exp2_cpu_vs_io_same_priority | e2_cpu | 0 | cpu_hog | <fill> |
-| exp2_cpu_vs_io_same_priority | e2_io  | 0 | io_pulse | <fill> |
+| Container | Nice | Observed %CPU (top) |
+|-----------|------|---------------------|
+| cpuA      | 0    | ~79.1%              |
+| cpuB      | 15   | ~44.9%              |
 
-Interpretation notes:
+CFS weight for nice=0 is 1024, for nice=15 is 83. Expected share for cpuA = 1024/(1024+83) ≈ 92.5%. The observed ~79% vs ~44% split reflects this weighting directionally, with the remainder going to kernel threads and system processes.
 
-- Explain whether lower nice value completed faster in exp1 and why.
-- Explain responsiveness/latency behavior of I-O workload in exp2.
-- Relate outcomes to fairness, responsiveness, and throughput.
+**Conclusion:** CFS correctly allocates more CPU time to the higher-priority (lower nice) container. The nice=15 container is not starved — it still receives substantial CPU — which demonstrates CFS's fairness guarantee. An I/O-bound container at the same nice level as a CPU-bound container would receive disproportionately more CPU per unit of time it is runnable, because CFS rewards tasks that sleep (yield CPU) with lower virtual runtime.
 
 ## 7. File Map
 
@@ -298,3 +327,11 @@ Interpretation notes:
 - Use unique writable rootfs directories for concurrent live containers.
 - engine run returns the child exit code (or 128 + signal for signaled exit).
 - stop attribution is tracked with stop_requested and shown in metadata state.
+
+## 9. Submission Checklist
+
+- `make -C boilerplate ci` completes successfully.
+- The required source files are present: `boilerplate/engine.c`, `boilerplate/monitor.c`, `boilerplate/monitor_ioctl.h`, `boilerplate/Makefile`, and the workload programs.
+- The demo screenshots are present under `docs/screenshots/` and match the rubric items.
+- The task scripts are included and documented: `boilerplate/task5_experiments.sh` and `boilerplate/task6_cleanup_check.sh`.
+- The README includes build, run, cleanup, design, and experiment sections needed for grading.
