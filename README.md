@@ -12,8 +12,8 @@ This README is organized to match the assignment rubric in project-guide.md.
 
 ## 1. Team Information
 
-- Member 1: Sonu Akash Soundararajan, PES1UG24AM908
-- Member 2: Rishit V N S, PES1UG24AM225
+- **Member 1: Sonu Akash Soundararajan, PES1UG24AM908**
+- **Member 2: Rishit V N S, PES1UG24AM225**
 
 ## 2. Build, Load, and Run Instructions
 
